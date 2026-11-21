@@ -2,7 +2,7 @@
 import PackageDescription
 
 let version = "51.0.0"
-let checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+let checksum = "7a7b67aa93824f46e82687cf5868b4bd9e06662563ed0abc5afe59774faddcb8"
 
 let package = Package(
     name: "CWasmtime",
