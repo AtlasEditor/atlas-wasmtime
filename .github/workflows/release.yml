@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: wasmtime version
+        required: false
+      publish:
+        description: publish the release
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      skip: ${{ steps.version.outputs.skip }}
+    steps:
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT: ${{ inputs.version }}
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          version=${INPUT:-$(gh api repos/bytecodealliance/wasmtime/releases/latest --jq .tag_name)}
+          version=${version#v}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$version" > /dev/null 2>&1; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            echo "wasmtime $version is released already."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$PUBLISH" = true ]; then
+            echo "Tag $version exists. A published version is never rebuilt." >&2
+            exit 1
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    if: needs.version.outputs.skip == 'false'
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      - name: Build
+        run: Tools/build-wasmtime.sh ${{ needs.version.outputs.version }} ${{ matrix.target }} "$RUNNER_TEMP/${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ runner.temp }}/${{ matrix.target }}
+
+  bundle:
+    needs: [version, build]
+    runs-on: macos-15
+    outputs:
+      checksum: ${{ steps.bundle.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/builds
+
+      - id: bundle
+        run: |
+          checksum=$(Tools/make-bundle.sh ${{ needs.version.outputs.version }} "$RUNNER_TEMP/builds" "$RUNNER_TEMP/bundle")
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle
+          path: ${{ runner.temp }}/bundle/CWasmtime-${{ needs.version.outputs.version }}.artifactbundle.zip
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-files
+          path: ${{ runner.temp }}/bundle/CWasmtime.artifactbundle
+
+  test:
+    needs: bundle
+    strategy:
+      matrix:
+        include:
+          - runner: macos-26
+          - runner: ubuntu-24.04
+            container: swift:6.2-jammy
+          - runner: ubuntu-24.04-arm
+            container: swift:6.2-jammy
+          - runner: windows-2022
+            arch: amd64
+          - runner: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bundle-files
+          path: Tests/CWasmtime.artifactbundle
+
+      - if: runner.os == 'Windows'
+        uses: compnerd/gha-setup-swift@v0.5.1
+        with:
+          swift-version: swift-6.4.3-release
+          swift-build: 6.4.3-RELEASE
+          build_arch: ${{ matrix.arch }}
+
+      - name: Test
+        run: swift test --package-path Tests
+
+      - name: Link for x86_64
+        if: runner.os == 'macOS'
+        run: swift build --package-path Tests --build-tests --arch x86_64
+
+  publish:
+    needs: [version, bundle, test]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      CHECKSUM: ${{ needs.bundle.outputs.checksum }}
+      ZIP: CWasmtime-${{ needs.version.outputs.version }}.artifactbundle.zip
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bundle
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.ZIP }}
+
+      - name: Commit and tag
+        run: |
+          sed -i "s/^let version = .*/let version = \"$VERSION\"/; s/^let checksum = .*/let checksum = \"$CHECKSUM\"/" Package.swift
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "build: wasmtime $VERSION" Package.swift
+          git tag "$VERSION"
+          git push origin HEAD:main "refs/tags/$VERSION"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh release create "$VERSION" "$ZIP" --title "wasmtime $VERSION" --notes "Built from wasmtime v$VERSION by [this run]($RUN).
+
+          SwiftPM checksum: \`$CHECKSUM\`
+
+          Check that the zip came from this repository's workflow: \`gh attestation verify $ZIP -R $GITHUB_REPOSITORY\`"
